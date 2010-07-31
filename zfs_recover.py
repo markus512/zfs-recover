@@ -6,7 +6,8 @@ import io, optparse, os, time, struct
 
 class AnyBlock:
 	'Basic class wityh common methods.'
-	__slots__ = frozenset(())
+	__slots__ = frozenset(('_format', '_magic', '_name', 'blocksize'))
+	_format = {}
 	def __eq__(self, other):
 		for attr in self.__slots__:
 			if attr[-1:] != '_':
@@ -14,21 +15,25 @@ class AnyBlock:
 					return False
 		return True
 	def __repr__(self):
-		repr = 'VB:'
+		repr = self._name + ':'
 		for attr in self.__slots__:
-			if attr[-1:] != '_':
-				repr += ' {}:{}'.format(attr, getattr(self, attr))
+			if attr[0] != '_':
+				value = getattr(self, attr)
+				if attr in self._format:
+					value = eval(self._format[attr].format(value))
+				repr += ' {}:{}'.format(attr, value)
 		return(repr)
 
 class VdevBootBlock(AnyBlock):
 	'Holds info about this vdev.'
-	__slots__ = frozenset(('addr', 'blocksize_', 'magic_', 'offset', 'size', 'version'))
-	magic_ = b'\x0c\xb1\x07\xb0\xf5\x02'
-	blocksize_ = 1 << 13 # 8k
+	__slots__ = frozenset(('addr', 'offset', 'size', 'version'))
+	_magic = b'\x0c\xb1\x07\xb0\xf5\x02'
+	_name = 'VdevBoot'
+	blocksize = 1 << 13 # 8k
 	def __init__(self, block, address):
 		self.addr = (address, )
 		self.version = 0
-		if block[0:6] == self.magic_:
+		if block[0:6] == self._magic:
 			( self.version,
 				self.offset,
 				self.size
@@ -36,15 +41,19 @@ class VdevBootBlock(AnyBlock):
 
 class Uberblock(AnyBlock):
 	'Holds all info about one uberblock.'
-	__slots__ = frozenset(('addr', 'birth', 'blocksize_', 'dva', 'fill', 'guid_sum', 'magic_', 'pad', 'phys_birth', 'prop', 'timestamp', 'txg', 'version'))
-	magic_ = b'\x0c\xb1\xba\x00' # b10c 00ba, oo-ba bloc!
-	blocksize_ = 1 << 10 # 1k
+	__slots__ = frozenset(('addr', 'birth', 'dva', 'fill', 'guid_sum', 'pad', 'phys_birth', 'prop', 'timestamp', 'txg', 'version'))
+	_format = {
+		'timestamp': 'time.strftime("%d %b %Y %H:%M:%S", time.localtime({}))',
+	}
+	_magic = b'\x0c\xb1\xba\x00' # b10c 00ba, oo-ba bloc!
+	_name = 'Uberblock'
+	blocksize = 1 << 10 # 1k
 	def __init__(self, block, address):
 		self.addr = (address, )
 		self.version = 0
 		self.dva = [0,0]
 		self.pad = [0,0]
-		if block[0:4] == self.magic_:
+		if block[0:4] == self._magic:
 			( self.version,
 				self.txg,
 				self.guid_sum,
@@ -61,15 +70,20 @@ class Uberblock(AnyBlock):
 
 class NvData(AnyBlock):
 	'Contents of the nvpair list.'
-	__slots__ = frozenset(('blocksize', 'encmethod', 'endian', 'endians', 'methods', 'nvflag', 'version'))
-	blocksize = (1<<17) - (1<<14) # 128k - 16k
-	endians = {
+	__slots__ = frozenset(('encmethod', 'endian', '_endians', '_methods', 'nvflag', 'version'))
+	_format = {
+		'encmethod': 'self._methods[{}]',
+		'endian': 'self._endians[{}]',
+	}
+	_endians = {
 		1: 'HOST_ENDIAN_x86',
 	}
-	methods = {
+	_methods = {
 		0: 'NV_ENCODE_NATIVE',
 		1: 'NV_ENCODE_XDR',
 	}
+	_name = 'NvData'
+	blocksize = (1<<17) - (1<<14) # 128k - 16k
 	def __init__(self, block, address):
 		( self.encmethod,
 			self.endian,
@@ -78,11 +92,11 @@ class NvData(AnyBlock):
 			self.nvflag
 		) = struct.unpack('BBHII', block[0:12])
 		if self.encmethod == 0:
-			print('NvData: incorrect format, encoding method unsupported:', self.methods[0])
-		elif not self.encmethod in self.methods:
+			print('NvData: incorrect format, encoding method unsupported:', self._methods[0])
+		elif not self.encmethod in self._methods:
 			print('NvData: incorrect fromat, encoding method should be 0 <= x <= 1.')
-		if not self.endian in self.endians:
-			print('NvData: incorrect fromat, endianess supported:', self.endians[1])
+		if not self.endian in self._endians:
+			print('NvData: incorrect fromat, endianess supported:', self._endians[1])
 		seek = 12
 		while True:
 			nvpair = NvPair(block[seek:])
@@ -91,7 +105,8 @@ class NvData(AnyBlock):
 
 class NvPair(AnyBlock):
 	'One NvPair record.'
-	__slots__ = frozenset(('blocksize', 'decsize', 'encsize', 'namesize'))
+	__slots__ = frozenset(('decsize', 'encsize', 'namesize'))
+	_name = 'NvPair'
 	def __init__(self, block):
 		self.blocksize = 0
 		( self.encsize,
@@ -133,8 +148,8 @@ class SourceDevice:
 			print(nv)
 			# checking uberblocks
 			for ublock_num in range (0, 128):
-				start_addr = (1 << 17) + ublock_num * Uberblock.blocksize_
-				end_addr = (1 << 17) + (ublock_num + 1) * Uberblock.blocksize_
+				start_addr = (1 << 17) + ublock_num * Uberblock.blocksize
+				end_addr = (1 << 17) + (ublock_num + 1) * Uberblock.blocksize
 				ub = Uberblock(block[start_addr:end_addr], vdev_addr + start_addr)
 				if ub.version > 0:
 					if not ub.txg in self.uberblocks:
