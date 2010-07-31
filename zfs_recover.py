@@ -5,16 +5,22 @@
 import io, optparse, os, time, struct
 
 class AnyBlock:
-	'Basic class wityh common methods.'
+	'''Basic class with common methods.
+	_format: formatting conventions for fields, skips field if format is None;
+	_magic: magic by which block is detected;
+	_name: name of the structure;
+	blocksize: size of the block, pre-set or computed.'''
 	__slots__ = frozenset(('_format', '_magic', '_name', 'blocksize'))
 	_format = {}
 	def __eq__(self, other):
+		'Compares all fields except private ones.'
 		for attr in self.__slots__:
-			if attr[-1:] != '_':
+			if attr[0] != '_':
 				if getattr(self, attr) != getattr(self, attr):
 					return False
 		return True
 	def __repr__(self):
+		'Returns string describing current block.'
 		repr = self._name + ':'
 		for attr in self.__slots__:
 			if attr[0] != '_':
@@ -25,7 +31,11 @@ class AnyBlock:
 		return(repr)
 
 class VdevBootBlock(AnyBlock):
-	'Holds info about this vdev.'
+	'''Holds info about vdev:
+	addr: list of copies;
+	offset: ???;
+	size: ???;
+	version: ???.'''
 	__slots__ = frozenset(('addr', 'offset', 'size', 'version'))
 	_magic = b'\x0c\xb1\x07\xb0\xf5\x02'
 	_name = 'VdevBoot'
@@ -40,8 +50,18 @@ class VdevBootBlock(AnyBlock):
 			) = struct.unpack('QQQ', block[8:32])
 
 class Uberblock(AnyBlock):
-	'Holds all info about one uberblock.'
-	__slots__ = frozenset(('addr', 'birth', 'dva', 'fill', 'guid_sum', 'pad', 'phys_birth', 'prop', 'timestamp', 'txg', 'version'))
+	'''Holds info about uberblock. Logically includes not only original uberblock but also its part - blkptr struct.
+	addr: list of copies;
+	birth: transaction group at block birth;
+	dva: three dva adresses, each address needs two long long integers;
+	fill: fill count;
+	guid_sum: sum of the vdev guids;
+	pad: three empty bytes;
+	prop: block properties - compression, type, etc;
+	timestamp: time when uberblock was writed;
+	txg: transaction group;
+	version: data format version, suported - 14.'''
+	__slots__ = frozenset(('addr', 'birth', 'dva', 'fill', 'guid_sum', 'pad', 'prop', 'timestamp', 'txg', 'version'))
 	_format = {
 		'timestamp': 'time.strftime("%d %b %Y %H:%M:%S", time.localtime({}))',
 	}
@@ -51,25 +71,35 @@ class Uberblock(AnyBlock):
 	def __init__(self, block, address):
 		self.addr = (address, )
 		self.version = 0
-		self.dva = [0,0]
-		self.pad = [0,0]
+		self.dva = [[0, 0], [0, 0], [0, 0]]
+		self.pad = [0, 0, 0]
 		if block[0:4] == self._magic:
 			( self.version,
 				self.txg,
 				self.guid_sum,
 				self.timestamp,
-				self.dva[0],
-				self.dva[1],
+				self.dva[0][0],
+				self.dva[0][1],
+				self.dva[1][0],
+				self.dva[1][1],
+				self.dva[2][0],
+				self.dva[2][1],
 				self.prop,
 				self.pad[0],
 				self.pad[1],
-				self.phys_birth,
+				self.pad[2],
 				self.birth,
 				self.fill
-			) = struct.unpack('QQQQQQQQQQQQ', block[8:104])
+			) = struct.unpack('QQQQQQQQQQQQQQQQ', block[8:136])
+			if self.version != 14:
+				print(self._name + ': unknown version, code should be updated to deal with this.', sep = '')
 
 class NvData(AnyBlock):
-	'Contents of the nvpair list.'
+	'''Header of the NvList.
+	encmethod: ???;
+	endian: ???;
+	nvflag: ???;
+	version: ???.'''
 	__slots__ = frozenset(('encmethod', 'endian', '_endians', '_methods', 'nvflag', 'version'))
 	_format = {
 		'encmethod': 'self._methods[{}]',
@@ -104,7 +134,10 @@ class NvData(AnyBlock):
 			return
 
 class NvPair(AnyBlock):
-	'One NvPair record.'
+	'''One NvPair record.
+	decsize: ???;
+	encsize: ???;
+	namesize: ???.'''
 	__slots__ = frozenset(('decsize', 'encsize', 'namesize'))
 	_name = 'NvPair'
 	def __init__(self, block):
@@ -115,6 +148,11 @@ class NvPair(AnyBlock):
 		) = struct.unpack('IIH', block[0:10])
 
 class SourceDevice:
+	'''One device.
+	devsize: detected size of the vdev;
+	vdev_label_size: size of one vdev label;
+	vboot: VdevBootBlock;
+	uberblocks: uberblocks list.'''
 	__slots__ = frozenset(('__file', 'devsize', 'vdev_label_size', 'vboot', 'uberblocks'))
 	vdev_label_size = 1 << 18 # 256k
 	def __init__(self, name):
