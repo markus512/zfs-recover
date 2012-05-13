@@ -1,8 +1,23 @@
-#!/usr/bin/env python3.1
+#!/usr/bin/env python3.2
 
-# (c) 2010 c.kworr@gmail.com
+import io, optparse, os, time, struct, sys
 
-import io, optparse, os, time, struct
+class Logger:
+	__slots__ = frozenset(('_prefix',))
+
+	def __init__(self):
+		self._prefix = []
+
+	def line(self, line):
+		print(''.join(self._prefix), line, sep = '')
+
+	def add_prefix(self, string):
+		self._prefix += string,
+
+	def drop_prefix(self):
+		self._prefix = self._prefix[:-1]
+
+log = Logger()
 
 class AnyBlock:
 	'''Basic class with common methods.
@@ -21,16 +36,34 @@ class AnyBlock:
 					return False
 		return True
 
-	def __repr__(self):
-		'Returns string describing current block.'
-		repr = self._name + ':'
+	def descr(self):
+		'Prints string describing current block.'
+		log.add_prefix('| ')
+		repr = []
 		for attr in self.__slots__:
 			if attr[0] != '_':
 				value = getattr(self, attr)
 				if attr in self._format:
 					value = eval(self._format[attr].format(value))
-				repr += ' {}:{}'.format(attr, value)
-		return(repr)
+				repr += '{}:{}'.format(attr, value),
+		log.line(' '.join(repr))
+		log.drop_prefix()
+
+	def dump(self, block):
+		'Prints hexadecimal block data.'
+		log.add_prefix('| ')
+		position = 0
+		while position < len(block):
+			if len(block) - position > 16:
+				data = block[position:position+16]
+			else:
+				data = block[position:]
+			hexes = []
+			for x in range(0, len(data)):
+				hexes += '{:02X}'.format(data[x]),
+			log.line('{:4d}: '.format(position) + ' '.join(hexes[0:8]) + ' : ' + ' '.join(hexes[8:16]) + ' ' + repr(data))
+			position += 16
+		log.drop_prefix()
 
 class VdevBootBlock(AnyBlock):
 	'''Holds info about vdev:
@@ -46,11 +79,15 @@ class VdevBootBlock(AnyBlock):
 	def __init__(self, block, address):
 		self.addr = (address, )
 		self.version = 0
+		log.line('{}: {}'.format(self._name, address))
 		if block[0:6] == self._magic:
 			( self.version,
 				self.offset,
 				self.size
 			) = struct.unpack('3Q', block[8:32])
+			self.descr()
+		else:
+			log.line('VDev unrecognized')
 
 class Uberblock(AnyBlock):
 	'''Holds info about uberblock. Logically includes not only original uberblock but also its part - blkptr struct.
@@ -91,8 +128,6 @@ class Uberblock(AnyBlock):
 				self.birth,
 				self.fill
 			) = struct.unpack('QQQQ6QQ24xQQ', block[8:136])
-			if self.version != 14:
-				print(self._name + ': unknown version, code should be updated to deal with this.', sep = '')
 
 class NvData(AnyBlock):
 	'''Header of the NvList.
@@ -219,7 +254,7 @@ class SourceDevice:
 	vdev_label_size: size of one vdev label;
 	vboot: VdevBootBlock;
 	uberblocks: uberblocks list.'''
-	__slots__ = frozenset(('__file', 'devsize', 'vdev_label_size', 'vboot', 'uberblocks'))
+	__slots__ = frozenset(('__file', 'devsize', 'dvas', 'vdev_label_size', 'vboot', 'uberblocks'))
 	vdev_label_size = 1 << 18 # 256k
 
 	def __init__(self, name):
@@ -229,7 +264,8 @@ class SourceDevice:
 
 		# checking device size
 		self.devsize = self.__file.seek(0, os.SEEK_END)
-		print('Detected size:', self.devsize, 'bytes.')
+		log.line('Detected size: {} bytes.'.format(self.devsize))
+		log.add_prefix('| ')
 
 		# checking blocks alignment and aligning them accordingly
 		vblocks = int(self.devsize / self.vdev_label_size)
@@ -243,14 +279,14 @@ class SourceDevice:
 				if type(self.vboot) == type(None):
 					self.vboot = vb
 				elif self.vboot != vb:
-					print('Found different VdevBootBlock.')
-					print('Old:', self.vboot)
-					print('New:', vb)
+					log.line('Found different VdevBootBlock.')
+					log.line('Old:' + self.vboot)
+					log.line('New:' + vb)
 				else:
 					self.vboot.addr += vb.addr
-			# XXX: check nvpairs
-			nv = NvData(block[1 << 14:1 << 17], vdev_addr + 1 << 14 ) # 16k - 128k, addr + 16k
-			print(nv)
+				# XXX: check nvpairs
+				nv = NvData(block[1 << 14:1 << 17], vdev_addr + 1 << 14 ) # 16k - 128k, addr + 16k
+				print(nv)
 			# checking uberblocks
 			for ublock_num in range (0, 128):
 				start_addr = (1 << 17) + ublock_num * Uberblock.blocksize
@@ -268,13 +304,15 @@ class SourceDevice:
 			txgs = list(self.uberblocks.keys())
 			txgs.reverse()
 			last_txg = txgs[0]
-			dvas = ()
+			self.dvas = []
+			dva_addrs = []
 			for dva in self.uberblocks[last_txg].dva:
-				print('Addr:', (dva[1] << 9) + 0x400000, dva[1], 1 << 9)
+				#print('Addr:', (dva[1] << 9) + 0x400000, dva[1], 1 << 9)
 				dva_block = self.read((dva[1] << 9) + 0x400000, 1 << 7)
-				dvas += DVA(dva_block),
-			for dva in dvas:
-				print(dva)
+				self.dvas += DVA(dva_block),
+				dva_addrs += '{:x}'.format(dva[1]),
+			log.line('DVA: {}'.format(', '.join(dva_addrs)))
+		log.drop_prefix()
 
 	def read(self, seek, size):
 		self.__file.seek(seek)
@@ -290,10 +328,17 @@ assert options.device != None, 'Please specify device to work on.'
 source = SourceDevice(options.device)
 
 # Printing found vdev boot
-print(source.vboot)
+#print(source.vboot)
 # Printing found uberblocks
+txgs = set()
 for txg in source.uberblocks:
-	print(source.uberblocks[txg])
+	txgs.add('{:x}'.format(txg))
+log.line('UberBlocks: {}'.format(', '.join(txgs)))
+
+dva_addrs = set()
+for dva in source.dvas:
+	dva_addrs.add('-'.join(dva.offset))
+log.line('DVAS: {}'.format(', '.join(dva_addrs)))
 
 if options.rollback:
 	strip_to = int(input('What transaction you want rollback to? '))
