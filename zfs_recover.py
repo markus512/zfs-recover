@@ -13,9 +13,8 @@ class AnyBlock:
 	'''Basic class with common methods.
 	_format: formatting conventions for fields, skips field if format is None;
 	_magic: magic by which block is detected;
-	_name: name of the structure;
 	blocksize: size of the block, pre-set or computed.'''
-	__slots__ = frozenset(('_format', '_magic', '_name', 'blocksize'))
+	__slots__ = frozenset(('_format', '_magic', 'blocksize'))
 	_format = {}
 
 	def __eq__(self, other):
@@ -53,26 +52,24 @@ class AnyBlock:
 
 class VdevBootBlock(AnyBlock):
 	'''Holds info about vdev:
-	addr: list of copies;
 	offset: ???;
 	size: ???;
 	version: ???.'''
-	__slots__ = frozenset(('addr', 'offset', 'size', 'version'))
-	_magic = b'\x0c\xb1\x07\xb0\xf5\x02'
-	_name = 'VdevBoot'
+	__slots__ = frozenset(['version'])
+	# I hove no good guides about vdev boot block format now
+	#_magic = b'\x0c\xb1\x07\xb0\xf5\x02'
 	blocksize = 1 << 13 # 8k
 
-	def __init__(self, block, address):
-		self.addr = (address, )
+	def __init__(self, block):
 		self.version = 0
-		log.info('{}: {}'.format(self._name, address))
-		if not block[0:6] == self._magic:
-			log.info('VDev magic unrecognized: {}'.format(bytes(block[0:6])))
-		( self.version,
-			self.offset,
-			self.size
-		) = struct.unpack('3Q', block[8:32])
-		self.descr()
+		log.info('VdevBoot: version:{}'.format(self.version))
+		#if not block[0:6] == self._magic:
+		#	log.info('VDev magic unrecognized: {}'.format(bytes(block[0:6])))
+		#( self.version,
+		#	self.offset,
+		#	self.size
+		#) = struct.unpack('3Q', block[8:32])
+		#self.descr()
 
 class Uberblock(AnyBlock):
 	'''Holds info about uberblock. Logically includes not only original uberblock but also its part - blkptr struct.
@@ -90,7 +87,6 @@ class Uberblock(AnyBlock):
 		'timestamp': 'time.strftime("%d %b %Y %H:%M:%S", time.localtime({}))',
 	}
 	_magic = b'\x0c\xb1\xba\x00' # b10c 00ba, oo-ba bloc!
-	_name = 'Uberblock'
 	blocksize = 1 << 10 # 1k
 
 	def __init__(self, block, address):
@@ -113,6 +109,7 @@ class Uberblock(AnyBlock):
 				self.birth,
 				self.fill
 			) = struct.unpack('QQQQ6QQ24xQQ', block[8:136])
+			log.info('UB: version:{} txg:{}'.format(self.version, self.txg))
 
 class NvData(AnyBlock):
 	'''Header of the NvList.
@@ -120,50 +117,58 @@ class NvData(AnyBlock):
 	endian: host endianess,
 	nvflag: ???;
 	version: ???.'''
-	__slots__ = frozenset(('encmethod', 'endian', '_endians', '_methods', 'nvflag', 'nvpairs', 'version'))
-	_format = {
-		'encmethod': 'self._methods[{}]',
-		'endian': 'self._endians[{}]',
-	}
+	__slots__ = frozenset(('encmethod', 'endian', '_endians', '_header_size', '_methods', 'nvflag', 'nvpairs', 'version'))
 	_endians = {
-		1: 'HOST_ENDIAN_x86',
+		0: 'BIG_ENDIAN',
+		1: 'LITTLE_ENDIAN',
 	}
+	_header_size = 12
 	_methods = {
 		0: 'NV_ENCODE_NATIVE',
 		1: 'NV_ENCODE_XDR',
 	}
-	_name = 'NvData'
 	blocksize = (1 << 17) - (1 << 14) # 128k - 16k
 
-	def __init__(self, block, address):
+	def __init__(self, block):
 		( self.encmethod,
 			self.endian,
 			# 2 pad of 1 byte
 			self.version,
 			self.nvflag
-		) = struct.unpack('>BB2xII', block[0:12])
-		if self.encmethod == 0:
-			print('NvData: incorrect format, encoding method unsupported:', self._methods[0])
-		elif not self.encmethod in self._methods:
-			print('NvData: incorrect fromat, encoding method should be 0 <= x <= 1.')
-		if not self.endian in self._endians:
-			print('NvData: incorrect fromat, endianess supported:', self._endians[1])
-		seek = 12
+		) = struct.unpack('>BB2xII', block[:self._header_size])
+		assert self.encmethod in self._methods, 'NvData: incorrect encmethod {}, encodings supported:{}'.format(self.encmethod, repr(self._methods))
+		assert self.endian in self._endians, 'NvData: incorrect endian {}, endianess supported: {}'.format(self.endian, repr(self._endians))
+		log.info('NvData: version:{} nvflag:{}'.format(self.version, self.nvflag))
+		seek = self._header_size
 		self.nvpairs = {}
-		while True:
-			nvpair = NvPair(block[seek:])
-			if nvpair.encsize == 0:
-				break
-			self.nvpairs[nvpair.name] = nvpair.data
-			seek += nvpair.encsize
+		if self.encmethod == 0: # NV_ENCODE_NATIVE
+			log.info('decoding not supported, skipping.')
+		else:
+			while True:
+				nvpair = NvPair(block[seek:])
+				if nvpair.encsize == 0:
+					break
+				self.nvpairs[nvpair.name] = nvpair.data
+				seek += nvpair.encsize
+		log.info('NvData: ends here')
+
+def nv_align4(number):
+	'''aligns number to double words'''
+	return (3 + number >> 2) << 2
+
+def decode_string(string):
+	'''stripped zero bytes and decodes string'''
+	return string.rstrip(b'\x00').decode('ascii')
 
 class NvPair(AnyBlock):
 	'''One NvPair record.
+	encsize: full size of record with all fields
 	decsize: ???;
-	encsize: ???;
-	namesize: ???.'''
-	__slots__ = frozenset(('data', 'datatype', 'decsize', 'elements', 'encsize', 'namesize', 'name'))
-	_name = 'NvPair'
+	namesize: size of the record name
+	name: record name
+	datatype: type of the stored data
+	elements: in case this is array number of its elements'''
+	__slots__ = frozenset(('_datatypes', 'data', 'datatype', 'decsize', 'elements', 'encsize', 'namesize', 'name'))
 	_datatypes = {
 		8: 'DATA_TYPE_UINT64',
 		9: 'DATA_TYPE_STRING',
@@ -174,32 +179,34 @@ class NvPair(AnyBlock):
 		self.blocksize = 0
 		( self.encsize,
 			self.decsize,
-			self.namesize,
-		) = struct.unpack('>III', block[0:12])
-		if self.encsize > 0:
-			self.namesize = (3 + self.namesize >> 2) << 2
-			data_start = self.namesize + 20
-			( self.name, 
-				self.datatype,
-				self.elements,
-			) = struct.unpack('>{}sII'.format(self.namesize), block[12:data_start])
-			self.name = self.name.rstrip(b'\x00').decode('ascii')
-			format = str(self.encsize - data_start) + 's'
-			if self.datatype == 8: # DATA_TYPE_UINT64
-				self.data = struct.unpack('>Q', block[data_start:self.encsize])[0]
-			elif self.datatype == 9: # DATA_TYPE_STRING
-				format = str((3 + struct.unpack('>I', block[data_start:data_start + 4])[0] >> 2) << 2) + 's'
-				data_start += 4
-				self.data = struct.unpack(format, block[data_start:self.encsize])[0]
-				self.data = self.data.rstrip(b'\x00').decode('ascii')
-			else:
-				log.info('Datatype: {}, {}.'.format(self.datatype, bytes(block[data_start:self.encsize])))
+		) = struct.unpack('>II', block[:8])
+		if self.encsize == 0:
+			return
+		self.namesize = nv_align4(struct.unpack('>I', block[8:12])[0])
+		data_start = 12 + self.namesize + 4 * 2
+		( self.name, 
+			self.datatype,
+			self.elements,
+		) = struct.unpack('>{}sII'.format(self.namesize), block[12:data_start])
+		self.name = decode_string(self.name)
+		data_format = str(self.encsize - data_start) + 's'
+		if self.datatype == 8: # DATA_TYPE_UINT64
+			self.data = struct.unpack('>Q', block[data_start:self.encsize])[0]
+		elif self.datatype == 9: # DATA_TYPE_STRING
+			length = nv_align4(struct.unpack('>I', block[data_start:data_start + 4])[0])
+			data_start += 4
+			self.data = decode_string(struct.unpack('{}s'.format(length), block[data_start:self.encsize])[0])
+		elif self.datatype == 19: # DATA_TYPE_NVLIST
+			self.data = NvData(block[data_start:self.encsize])
+		else:
+			log.info('Unknown datatype: {}, {}.'.format(self.datatype, bytes(block[data_start:self.encsize])))
+			raise SystemExit
+		log.info('NV: {} {}'.format(self.name, repr(self.data)))
 
 class DVA(AnyBlock):
 	'''DVA record.
 	'''
 	__slots__ = frozenset(('asize', 'birth_txg', 'checksum', 'cksum', 'comp', 'fill', 'gang', 'lsize', 'offset', 'psize', 'type', 'vdev'))
-	_name = 'DVA'
 	blocksize = 1 << 7 # 128
 
 	def __init__(self, block):
@@ -259,19 +266,17 @@ class SourceDevice:
 		for vdev_addr in (0, self.vdev_label_size, (vblocks - 2) * self.vdev_label_size, (vblocks - 1) * self.vdev_label_size):
 			block = self.read(vdev_addr, self.vdev_label_size)
 			# checking vboot headers
-			vb = VdevBootBlock(block[1 << 13:1 << 14], vdev_addr + 1 << 13) # 8k - 16k, addr + 8k
-			if vb.version > 0:
+			vb = VdevBootBlock(block[1 << 13:1 << 14]) # 8k - 16k
+			if vb.version >= 0:
+				print(repr(self.vboot), repr(vb))
 				if type(self.vboot) == type(None):
 					self.vboot = vb
 				elif self.vboot != vb:
 					log.info('Found different VdevBootBlock.')
 					log.info('Old:' + self.vboot)
 					log.info('New:' + vb)
-				else:
-					self.vboot.addr += vb.addr
 				# XXX: check nvpairs
-				nv = NvData(block[1 << 14:1 << 17], vdev_addr + 1 << 14 ) # 16k - 128k, addr + 16k
-				print(nv)
+				nv = NvData(block[1 << 14:1 << 17]) # 16k - 128k
 			# checking uberblocks
 			for ublock_num in range (0, 128):
 				start_addr = (1 << 17) + ublock_num * Uberblock.blocksize
@@ -300,9 +305,9 @@ class SourceDevice:
 				log.info('DVA: {}'.format(', '.join(dva_addrs)))
 
 	def read(self, start, size):
-		log.info('Reading {} bytes @0x{:x}.'.format(size, start))
+		#log.info('Reading {} bytes @0x{:x}.'.format(size, start))
 		if start in self.cache:
-			log.info('Start addr hit.')
+			#log.info('Start addr hit.')
 			if size <= self.cache[start]['size']:
 				return(self.cache[start]['block'][0:size])
 			else:
@@ -310,9 +315,9 @@ class SourceDevice:
 		else:
 			for addr in self.cache:
 				if start >= addr and start + size <= addr + self.cache[addr]['size']:
-					log.info('Range hit.')
+					#log.info('Range hit.')
 					return(self.cache[addr][start - addr:start - addr + size])
-		log.info('No hit.')
+		#log.info('No hit.')
 		self.__file.seek(start)
 		block = memoryview(self.__file.read(size))
 		self.cache[start] = {
@@ -333,15 +338,6 @@ source = SourceDevice(args.device)
 # Printing found vdev boot
 #print(source.vboot)
 # Printing found uberblocks
-txgs = set()
-for txg in source.uberblocks:
-	txgs.add('{:x}'.format(txg))
-log.info('UberBlocks: {}'.format(', '.join(txgs)))
-
-dva_addrs = set()
-for dva in source.dvas:
-	dva_addrs.add('-'.join(dva.offset))
-log.info('DVAS: {}'.format(', '.join(dva_addrs)))
 
 if args.rollback:
 	strip_to = int(input('What transaction you want rollback to? '))
